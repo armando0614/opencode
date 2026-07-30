@@ -106,6 +106,7 @@ const NAVIGATION_SLACK_ID = "session-navigation-slack"
 const TRANSCRIPT_TAIL_ROWS = 40
 const TRANSCRIPT_BACKFILL_CHUNK = 60
 const TRANSCRIPT_BACKFILL_DELAY = 120
+const SESSION_IMAGE_LIMIT = 6
 
 const context = createContext<{
   width: number
@@ -115,6 +116,7 @@ const context = createContext<{
   markdownMode: () => "source" | "rendered"
   groupExploration: () => boolean
   diffWrapMode: () => "word" | "none"
+  imageKeys: () => ReadonlySet<string>
   models: () => ModelInfo[]
   config: ReturnType<typeof useConfig>["data"]
 }>()
@@ -144,6 +146,7 @@ export function Session() {
   const promptRef = usePromptRef()
   const session = createMemo(() => data.session.get(route.sessionID))
   const messages = () => data.session.message.list(route.sessionID)
+  const imageKeys = createMemo(() => sessionImageKeys(messages(), session()?.revert?.messageID))
   const currentLocation = useLocation()
   const location = createMemo(() => session()?.location ?? currentLocation.ref)
 
@@ -968,6 +971,7 @@ export function Session() {
         markdownMode,
         groupExploration,
         diffWrapMode,
+        imageKeys,
         models,
         config,
       }}
@@ -1131,11 +1135,7 @@ function SessionRowView(props: SessionRowViewProps) {
         </Match>
         <Match when={props.row.type === "turn-usage" ? props.row : undefined}>
           {(row) => (
-            <TurnTokenUsage
-              messageIDs={row().messageIDs}
-              previousCache={row().previousCache}
-              message={props.message}
-            />
+            <TurnTokenUsage messageIDs={row().messageIDs} previousCache={row().previousCache} message={props.message} />
           )}
         </Match>
       </Switch>
@@ -1242,21 +1242,10 @@ function TurnTokenToolCalls(props: { tools: SessionMessageAssistantTool[] }) {
         <For each={props.tools}>
           {(tool) => (
             <box flexDirection="row">
-              <text
-                width={nameWidth()}
-                flexShrink={0}
-                fg={theme.text.subdued}
-                attributes={TextAttributes.BOLD}
-              >
+              <text width={nameWidth()} flexShrink={0} fg={theme.text.subdued} attributes={TextAttributes.BOLD}>
                 {tool.name}
               </text>
-              <text
-                fg={theme.text.subdued}
-                attributes={TextAttributes.DIM}
-                wrapMode="word"
-                flexGrow={1}
-                minWidth={0}
-              >
+              <text fg={theme.text.subdued} attributes={TextAttributes.DIM} wrapMode="word" flexGrow={1} minWidth={0}>
                 {turnTokenToolSummary(tool)}
               </text>
             </box>
@@ -1273,9 +1262,7 @@ function turnTokenToolSummary(tool: SessionMessageAssistantTool) {
   const primaryKey = ["command", "id", "pattern", "url", "query", "path", "description", "code"].find(
     (key) => key in data,
   )
-  const input = Object.entries(data).filter(([, value]) =>
-    ["string", "number", "boolean"].includes(typeof value),
-  )
+  const input = Object.entries(data).filter(([, value]) => ["string", "number", "boolean"].includes(typeof value))
   const primary = input.find(([key]) => key === primaryKey)?.[1]
   const details = input.filter(([key]) => key !== primaryKey).map(([key, value]) => `${key}: ${String(value)}`)
   return [primary === undefined ? "" : String(primary), ...details].filter(Boolean).join("  ")
@@ -1357,7 +1344,7 @@ function SessionPartView(props: { partRef: PartRef; message: (messageID: string)
             />
           </Match>
           <Match when={item().type === "tool"}>
-            <ToolPart part={item() as SessionMessageAssistantTool} />
+            <ToolPartWithImages messageID={props.partRef.messageID} part={item() as SessionMessageAssistantTool} />
           </Match>
         </Switch>
       )}
@@ -1504,13 +1491,13 @@ function SessionGroupView(props: {
       if (message?.type !== "assistant") return []
       const part = resolvePart(message, ref.partID)
       if (part?.type !== "tool") return []
-      return [part]
+      return [{ messageID: ref.messageID, part }]
     })
   const grouped = createMemo(() => parts(props.refs))
   const pending = createMemo(() => parts(props.pending))
   const label = createMemo(() => {
-    const counts = grouped().reduce<Record<string, number>>((result, part) => {
-      const tool = toolDisplay(part.name)
+    const counts = grouped().reduce<Record<string, number>>((result, item) => {
+      const tool = toolDisplay(item.part.name)
       const name = tool === "grep" || tool === "glob" ? "search" : tool
       result[name] = (result[name] ?? 0) + 1
       return result
@@ -1524,7 +1511,11 @@ function SessionGroupView(props: {
     <Show when={grouped().length > 0 || pending().length > 0}>
       <Show
         when={ctx.groupExploration()}
-        fallback={<For each={[...grouped(), ...pending()]}>{(part) => <ToolPart part={part} />}</For>}
+        fallback={
+          <For each={[...grouped(), ...pending()]}>
+            {(item) => <ToolPartWithImages messageID={item.messageID} part={item.part} />}
+          </For>
+        }
       >
         <Show when={grouped().length > 0}>
           <InlineToolRow
@@ -1544,9 +1535,10 @@ function SessionGroupView(props: {
           </InlineToolRow>
         </Show>
         <Show when={expanded() && grouped().length > 0}>
-          <For each={grouped()}>{(part) => <ToolPart part={part} />}</For>
+          <For each={grouped()}>{(item) => <ToolPart part={item.part} />}</For>
         </Show>
-        <For each={pending()}>{(part) => <ToolPart part={part} />}</For>
+        <ToolImages parts={grouped()} visible={ctx.imageKeys()} />
+        <For each={pending()}>{(item) => <ToolPartWithImages messageID={item.messageID} part={item.part} />}</For>
       </Show>
     </Show>
   )
@@ -1680,8 +1672,7 @@ function CompactionMessage(props: { message: Extract<SessionMessageInfo, { type:
   const text = () =>
     props.message.status === "failed" ? (cancelled() ? "" : props.message.error.message) : props.message.summary
   const content = createMemo(() => text().trim())
-  const color = () =>
-    status() === "failed" && !cancelled() ? theme.text.feedback.error.default : theme.text.subdued
+  const color = () => (status() === "failed" && !cancelled() ? theme.text.feedback.error.default : theme.text.subdued)
   return (
     <box>
       <box flexDirection="row" alignItems="center">
@@ -2001,7 +1992,9 @@ function AssistantMessage(props: { message: SessionMessageAssistant; last: boole
               <Show when={exploration().get((content as SessionMessageAssistantTool).id)?.first !== false}>
                 <Show
                   when={exploration().get((content as SessionMessageAssistantTool).id)}
-                  fallback={<ToolPart part={content as SessionMessageAssistantTool} />}
+                  fallback={
+                    <ToolPartWithImages messageID={props.message.id} part={content as SessionMessageAssistantTool} />
+                  }
                 >
                   {(summary) => <ExplorationSummary {...summary()} />}
                 </Show>
@@ -2316,6 +2309,88 @@ function ToolPart(props: { part: SessionMessageAssistantTool }) {
   )
 }
 
+function ToolPartWithImages(props: { messageID: string; part: SessionMessageAssistantTool }) {
+  const ctx = use()
+  return (
+    <>
+      <ToolPart part={props.part} />
+      <ToolImages parts={[props]} visible={ctx.imageKeys()} />
+    </>
+  )
+}
+
+export function ToolImages(props: {
+  parts: readonly { messageID: string; part: SessionMessageAssistantTool }[]
+  visible: ReadonlySet<string>
+}) {
+  const dimensions = useTerminalDimensions()
+  const images = createMemo(() =>
+    props.parts
+      .flatMap((item) => inlineToolImages(item.messageID, item.part))
+      .filter((image) => props.visible.has(image.key)),
+  )
+  const height = createMemo(() => Math.max(6, Math.min(18, Math.floor((dimensions().width - 6) / 4))))
+
+  return (
+    <Show when={images().length > 0}>
+      <box flexDirection="column" flexShrink={0} paddingLeft={3} paddingRight={2} gap={1}>
+        <For each={images().slice(0, 3)}>
+          {(image) => {
+            const [failed, setFailed] = createSignal(false)
+            return (
+              <box
+                width="100%"
+                maxWidth={70}
+                height={height()}
+                flexShrink={0}
+                alignItems="center"
+                justifyContent="center"
+              >
+                <Show when={!failed()} fallback={<text>No preview</text>}>
+                  <image
+                    id={`session-tool-image-${image.key}`}
+                    source={image.uri}
+                    fit="fit"
+                    protocol="auto"
+                    width="100%"
+                    height="100%"
+                    onError={() => setFailed(true)}
+                  />
+                </Show>
+              </box>
+            )
+          }}
+        </For>
+        <Show when={images().length > 3}>
+          <text>+{images().length - 3} more images</text>
+        </Show>
+      </box>
+    </Show>
+  )
+}
+
+export function sessionImageKeys(messages: readonly SessionMessageInfo[], revertBoundary?: string) {
+  return new Set(
+    messages
+      .filter((message) => !revertBoundary || message.id < revertBoundary)
+      .flatMap((message) =>
+        message.type === "assistant"
+          ? message.content.flatMap((part) => (part.type === "tool" ? inlineToolImages(message.id, part) : []))
+          : [],
+      )
+      .map((image) => image.key)
+      .slice(-SESSION_IMAGE_LIMIT),
+  )
+}
+
+function inlineToolImages(messageID: string, part: SessionMessageAssistantTool) {
+  return toolDisplayContent(part.state).flatMap((content, index) =>
+    content.type === "file" && content.mime.startsWith("image/") && content.uri.startsWith("data:image/")
+      ? [{ ...content, key: `${messageID}:${part.id}:${index}` }]
+      : [],
+  )
+}
+
 type ToolProps = {
   input: Record<string, unknown>
   metadata: Record<string, unknown>
@@ -2361,10 +2436,7 @@ function GenericTool(props: ToolProps) {
             {(value) => (
               <box gap={1}>
                 <text>
-                  <span style={{ bg: theme.raise(theme.background.default), fg: theme.text.subdued }}>
-                    {" "}
-                    Output{" "}
-                  </span>
+                  <span style={{ bg: theme.raise(theme.background.default), fg: theme.text.subdued }}> Output </span>
                 </text>
                 <box paddingLeft={1}>
                   <text fg={theme.text.default} wrapMode="word">
@@ -2616,9 +2688,7 @@ function BlockToolContent(props: BlockToolProps & { borderColor: RGBA }) {
               <Show
                 when={props.spinner}
                 fallback={
-                  <text fg={permission() ? theme.text.feedback.warning.default : theme.text.subdued}>
-                    {title()}
-                  </text>
+                  <text fg={permission() ? theme.text.feedback.warning.default : theme.text.subdued}>{title()}</text>
                 }
               >
                 <Spinner color={permission() ? theme.text.feedback.warning.default : theme.text.subdued}>
