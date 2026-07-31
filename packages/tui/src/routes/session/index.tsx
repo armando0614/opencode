@@ -146,7 +146,9 @@ export function Session() {
   const promptRef = usePromptRef()
   const session = createMemo(() => data.session.get(route.sessionID))
   const messages = () => data.session.message.list(route.sessionID)
-  const imageKeys = createMemo(() => sessionImageKeys(messages(), session()?.revert?.messageID))
+  const imageKeys = createMemo(() =>
+    config.session?.image_preview ? sessionImageKeys(messages(), session()?.revert?.messageID) : new Set<string>(),
+  )
   const currentLocation = useLocation()
   const location = createMemo(() => session()?.location ?? currentLocation.ref)
 
@@ -1912,6 +1914,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
               </For>
             </box>
           </Show>
+          <SessionImages images={sessionMessageImages(props.message)} visible={ctx.imageKeys()} />
         </box>
       </box>
     </Show>
@@ -2323,12 +2326,17 @@ export function ToolImages(props: {
   parts: readonly { messageID: string; part: SessionMessageAssistantTool }[]
   visible: ReadonlySet<string>
 }) {
+  const images = createMemo(() => props.parts.flatMap((item) => inlineToolImages(item.messageID, item.part)))
+
+  return <SessionImages images={images()} visible={props.visible} />
+}
+
+export function SessionImages(props: {
+  images: readonly { key: string; uri: string }[]
+  visible: ReadonlySet<string>
+}) {
   const dimensions = useTerminalDimensions()
-  const images = createMemo(() =>
-    props.parts
-      .flatMap((item) => inlineToolImages(item.messageID, item.part))
-      .filter((image) => props.visible.has(image.key)),
-  )
+  const images = createMemo(() => props.images.filter((image) => props.visible.has(image.key)))
   const height = createMemo(() => Math.max(6, Math.min(18, Math.floor((dimensions().width - 6) / 4))))
 
   return (
@@ -2348,7 +2356,7 @@ export function ToolImages(props: {
               >
                 <Show when={!failed()} fallback={<text>No preview</text>}>
                   <image
-                    id={`session-tool-image-${image.key}`}
+                    id={`session-image-${image.key}`}
                     source={image.uri}
                     fit="fit"
                     protocol="auto"
@@ -2373,14 +2381,22 @@ export function sessionImageKeys(messages: readonly SessionMessageInfo[], revert
   return new Set(
     messages
       .filter((message) => !revertBoundary || message.id < revertBoundary)
-      .flatMap((message) =>
-        message.type === "assistant"
-          ? message.content.flatMap((part) => (part.type === "tool" ? inlineToolImages(message.id, part) : []))
-          : [],
-      )
+      .flatMap(sessionMessageImages)
       .map((image) => image.key)
       .slice(-SESSION_IMAGE_LIMIT),
   )
+}
+
+export function sessionMessageImages(message: SessionMessageInfo) {
+  if (message.type === "user") {
+    return (message.files ?? []).flatMap((file, index) =>
+      file.mime.startsWith("image/")
+        ? [{ key: `${message.id}:file:${index}`, uri: `data:${file.mime};base64,${file.data}` }]
+        : [],
+    )
+  }
+  if (message.type !== "assistant") return []
+  return message.content.flatMap((part) => (part.type === "tool" ? inlineToolImages(message.id, part) : []))
 }
 
 function inlineToolImages(messageID: string, part: SessionMessageAssistantTool) {
