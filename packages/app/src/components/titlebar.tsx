@@ -133,16 +133,21 @@ export function Titlebar(props: { update?: TitlebarUpdate }) {
       onInstall: () => props.update?.install(),
     }
   })
-  const v2RightState = createMemo<TitlebarV2RightState>(() => ({
-    browserPreview: {
-      visible: platform.platform === "desktop" && !!platform.browserPreview && layout.route().type === "session",
-      opened: layout.browserPreview.opened(),
-      label: language.t("command.browserPreview.toggle"),
-      keybind: command.keybindParts("browserPreview.toggle"),
-      onToggle: () => layout.browserPreview.toggle(),
-    },
-    update: updateState(),
-  }))
+  const v2RightState = createMemo<TitlebarV2RightState>(() => {
+    const platformReady = !!platform && platform.platform === "desktop" && !!platform.browserPreview
+    const sessionRoute = !!layout && layout.route()?.type === "session"
+    const hasBrowserPreview = platformReady && sessionRoute && !!layout?.browserPreview
+    return {
+      browserPreview: {
+        visible: hasBrowserPreview,
+        opened: hasBrowserPreview ? layout.browserPreview.opened() : false,
+        label: language.t("command.browserPreview.toggle"),
+        keybind: command.keybindParts("browserPreview.toggle"),
+        onToggle: () => layout?.browserPreview?.toggle(),
+      },
+      update: updateState(),
+    }
+  })
 
   const back = () => {
     const next = backPath(history)
@@ -692,7 +697,7 @@ function TitlebarV2Right(props: { state: TitlebarV2RightState }) {
       <Show when={props.state.update.visible}>
         <TitlebarUpdateIconButton state={props.state.update} />
       </Show>
-      <Show when={props.state.browserPreview.visible}>
+      <Show when={props.state?.browserPreview?.visible}>
         <TooltipV2
           class="shrink-0"
           placement="bottom"

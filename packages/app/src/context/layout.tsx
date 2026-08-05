@@ -61,12 +61,33 @@ type SessionTabs = {
   all: string[]
 }
 
+type SessionPanels = {
+  terminal: { opened: boolean; height: number }
+  review: { panelOpened: boolean }
+  fileTree: { opened: boolean; width: number; tab: "changes" | "all" }
+  session: { width: number }
+  browserPreview: { opened: boolean; width: number; url: string }
+}
+
+const defaultSessionPanels = (): SessionPanels => ({
+  terminal: { opened: false, height: DEFAULT_TERMINAL_HEIGHT },
+  review: { panelOpened: DEFAULT_REVIEW_PANEL_OPENED },
+  fileTree: { opened: false, width: DEFAULT_FILE_TREE_WIDTH, tab: "changes" },
+  session: { width: DEFAULT_SESSION_WIDTH },
+  browserPreview: {
+    opened: false,
+    width: DEFAULT_BROWSER_PREVIEW_WIDTH,
+    url: DEFAULT_BROWSER_PREVIEW_URL,
+  },
+})
+
 type SessionView = {
   scroll: Record<string, SessionScroll>
   reviewOpen?: string[]
   pendingMessage?: string
   pendingMessageAt?: number
   todoCollapsed?: boolean
+  panels?: SessionPanels
 }
 
 type TabHandoff = {
@@ -248,27 +269,97 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         return next
       })()
 
+      // v6 → v7: seed per-session panels from the universal panel state, then drop
+      // the universal panel fields. Sessions not present in sessionView start with defaults.
+      const migratedPanels = ((): { sessionView: unknown; value: unknown } => {
+        if (!isRecord(sessionView)) return { sessionView, value: value.sessionView }
+        const hasUniversal = [
+          value.terminal,
+          value.review,
+          value.fileTree,
+          value.session,
+          value.browserPreview,
+        ].some(isRecord)
+        if (!hasUniversal) return { sessionView, value: value.sessionView }
+
+        const seeded: SessionPanels = (() => {
+          const t = isRecord(value.terminal) ? value.terminal : undefined
+          const r = isRecord(value.review) ? value.review : undefined
+          const f = isRecord(value.fileTree) ? value.fileTree : undefined
+          const s = isRecord(value.session) ? value.session : undefined
+          const b = isRecord(value.browserPreview) ? value.browserPreview : undefined
+          return {
+            terminal: {
+              opened: typeof t?.opened === "boolean" ? t.opened : false,
+              height: typeof t?.height === "number" ? t.height : DEFAULT_TERMINAL_HEIGHT,
+            },
+            review: {
+              panelOpened:
+                typeof r?.panelOpened === "boolean" ? r.panelOpened : DEFAULT_REVIEW_PANEL_OPENED,
+            },
+            fileTree: {
+              opened: typeof f?.opened === "boolean" ? f.opened : false,
+              width: typeof f?.width === "number" ? f.width : DEFAULT_FILE_TREE_WIDTH,
+              tab: f?.tab === "all" ? "all" : "changes",
+            },
+            session: {
+              width: typeof s?.width === "number" ? s.width : DEFAULT_SESSION_WIDTH,
+            },
+            browserPreview: {
+              opened: typeof b?.opened === "boolean" ? b.opened : false,
+              width: typeof b?.width === "number" ? b.width : DEFAULT_BROWSER_PREVIEW_WIDTH,
+              url: typeof b?.url === "string" ? b.url : DEFAULT_BROWSER_PREVIEW_URL,
+            },
+          }
+        })()
+
+        let changed = false
+        const next = Object.fromEntries(
+          Object.entries(sessionView).map(([key, view]) => {
+            if (!isRecord(view)) return [key, view]
+            if (view.panels) return [key, view]
+            changed = true
+            return [key, { ...view, panels: seeded }]
+          }),
+        )
+        if (!changed) return { sessionView, value: value.sessionView }
+        return { sessionView: next, value: next }
+      })()
+
+      const finalSessionView = migratedPanels.sessionView
+
       if (
         migratedSidebar === sidebar &&
         migratedReview === review &&
         migratedFileTree === fileTree &&
         migratedSessionTabs === value.sessionTabs &&
-        sessionView === value.sessionView
+        finalSessionView === sessionView
       ) {
         return value
       }
 
-      return {
+      const next: Record<string, unknown> = {
         ...value,
         sidebar: migratedSidebar,
         review: migratedReview,
         fileTree: migratedFileTree,
         sessionTabs: migratedSessionTabs,
-        sessionView,
+        sessionView: finalSessionView,
       }
+
+      // Drop the v6 universal panel fields; review.diffStyle and mobileSidebar stay.
+      delete next.terminal
+      delete next.session
+      delete next.browserPreview
+      if (isRecord(next.review)) {
+        const { panelOpened: _panel, ...rest } = next.review
+        next.review = rest
+      }
+
+      return next
     }
 
-    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v6"])
+    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v6", "layout.v7"])
     const [store, setStore, _, ready] = persisted(
       { ...target, migrate },
       createStore({
@@ -278,26 +369,8 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           workspaces: {} as Record<string, boolean>,
           workspacesDefault: false,
         },
-        terminal: {
-          height: DEFAULT_TERMINAL_HEIGHT,
-          opened: false,
-        },
         review: {
           diffStyle: "split" as ReviewDiffStyle,
-          panelOpened: DEFAULT_REVIEW_PANEL_OPENED,
-        },
-        fileTree: {
-          opened: false,
-          width: DEFAULT_FILE_TREE_WIDTH,
-          tab: "changes" as "changes" | "all",
-        },
-        session: {
-          width: DEFAULT_SESSION_WIDTH,
-        },
-        browserPreview: {
-          opened: false,
-          width: DEFAULT_BROWSER_PREVIEW_WIDTH,
-          url: DEFAULT_BROWSER_PREVIEW_URL,
         },
         mobileSidebar: {
           opened: false,
@@ -599,6 +672,147 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       if (sessionTimer !== undefined) window.clearTimeout(sessionTimer)
     })
 
+    // --- Flat accessors (Plan A1) -------------------------------------------
+    // The store holds per-session panels under `store.sessionView[sessionKey].panels`.
+    // Legacy callers (and many existing components) still consume `layout.terminal`,
+    // `layout.session`, `layout.fileTree`, `layout.browserPreview` as if those
+    // existed at the root of the layout context. These flat accessors delegate to
+    // a single "current" session's panels so the rest of the app keeps working
+    // unchanged. Writes go through `ensurePanelsForWrite()` which seeds the
+    // panels object on demand so consumers never see `undefined`.
+
+    const fallbackKey = (): string => {
+      const active = usage.active
+      if (active && store.sessionView[active]) return active
+      const keys = Object.keys(store.sessionView)
+      if (keys.length > 0) return keys[0]!
+      return ""
+    }
+
+    const flatPanels = (): SessionPanels => {
+      const key = fallbackKey()
+      const existing = key ? store.sessionView[key]?.panels : undefined
+      return existing ?? defaultSessionPanels()
+    }
+
+    const ensurePanelsForWrite = (): { sessionKey: string; panels: SessionPanels } => {
+      const active = usage.active
+      const key = active && store.sessionView[active] ? active : fallbackKey()
+      let panels = key ? store.sessionView[key]?.panels : undefined
+      if (!panels) panels = defaultSessionPanels()
+      if (key && !store.sessionView[key]?.panels) {
+        setStore(
+          "sessionView",
+          key,
+          produce((draft: { panels?: SessionPanels }) => {
+            draft.panels = panels
+          }),
+        )
+      }
+      return { sessionKey: key, panels }
+    }
+
+    const flatTerminal = () => {
+      const panels = createMemo(() => flatPanels().terminal)
+      return {
+        height: createMemo(() => panels().height),
+        resize(next: number) {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.terminal.height === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "terminal", "height", next)
+        },
+      }
+    }
+
+    const flatSession = () => {
+      const panels = createMemo(() => flatPanels().session)
+      return {
+        width: createMemo(() => panels().width),
+        resize(next: number) {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.session.width === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "session", "width", next)
+        },
+      }
+    }
+
+    const flatFileTree = () => {
+      const panels = createMemo(() => flatPanels().fileTree)
+      return {
+        opened: createMemo(() => panels().opened),
+        width: createMemo(() => panels().width),
+        tab: createMemo(() => panels().tab),
+        toggle() {
+          const { panels: p } = ensurePanelsForWrite()
+          setStore(
+            "sessionView",
+            ensurePanelsForWrite().sessionKey,
+            "panels",
+            "fileTree",
+            "opened",
+            !p.fileTree.opened,
+          )
+        },
+        resize(next: number) {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.fileTree.width === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "fileTree", "width", next)
+        },
+        setTab(next: "changes" | "all") {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.fileTree.tab === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "fileTree", "tab", next)
+        },
+      }
+    }
+
+    const flatBrowserPreview = () => {
+      const panels = createMemo(() => flatPanels().browserPreview)
+      return {
+        opened: createMemo(() => panels().opened),
+        width: createMemo(() => panels().width),
+        url: createMemo(() => panels().url),
+        toggle() {
+          const { panels: p } = ensurePanelsForWrite()
+          const next = !p.browserPreview.opened
+          setStore(
+            "sessionView",
+            ensurePanelsForWrite().sessionKey,
+            "panels",
+            "browserPreview",
+            "opened",
+            next,
+          )
+          if (!next) void platform.browserPreview?.hide()
+        },
+        close() {
+          const { panels: p } = ensurePanelsForWrite()
+          if (!p.browserPreview.opened) return
+          setStore(
+            "sessionView",
+            ensurePanelsForWrite().sessionKey,
+            "panels",
+            "browserPreview",
+            "opened",
+            false,
+          )
+          void platform.browserPreview?.hide()
+        },
+        resize(next: number) {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.browserPreview.width === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "browserPreview", "width", next)
+        },
+        setUrl(next: string) {
+          const { panels: p } = ensurePanelsForWrite()
+          if (p.browserPreview.url === next) return
+          setStore("sessionView", ensurePanelsForWrite().sessionKey, "panels", "browserPreview", "url", next)
+        },
+      }
+    }
+
+    // -----------------------------------------------------------------------
+
     return {
       route,
       ready,
@@ -665,96 +879,14 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           setStore("sidebar", "workspaces", directory, !current)
         },
       },
-      terminal: {
-        height: createMemo(() => store.terminal.height),
-        resize(height: number) {
-          setStore("terminal", "height", height)
-        },
-      },
       review: {
         diffStyle: createMemo(() => store.review?.diffStyle ?? "split"),
         setDiffStyle(diffStyle: ReviewDiffStyle) {
           if (!store.review) {
-            setStore("review", { diffStyle, panelOpened: DEFAULT_REVIEW_PANEL_OPENED })
+            setStore("review", { diffStyle })
             return
           }
           setStore("review", "diffStyle", diffStyle)
-        },
-      },
-      fileTree: {
-        opened: createMemo(() => store.fileTree?.opened ?? true),
-        width: createMemo(() => store.fileTree?.width ?? DEFAULT_FILE_TREE_WIDTH),
-        tab: createMemo(() => store.fileTree?.tab ?? "changes"),
-        setTab(tab: "changes" | "all") {
-          if (!store.fileTree) {
-            setStore("fileTree", { opened: true, width: DEFAULT_FILE_TREE_WIDTH, tab })
-            return
-          }
-          setStore("fileTree", "tab", tab)
-        },
-        open() {
-          if (!store.fileTree) {
-            setStore("fileTree", { opened: true, width: DEFAULT_FILE_TREE_WIDTH, tab: "changes" })
-            return
-          }
-          setStore("fileTree", "opened", true)
-        },
-        close() {
-          if (!store.fileTree) {
-            setStore("fileTree", { opened: false, width: DEFAULT_FILE_TREE_WIDTH, tab: "changes" })
-            return
-          }
-          setStore("fileTree", "opened", false)
-        },
-        toggle() {
-          if (!store.fileTree) {
-            setStore("fileTree", { opened: true, width: DEFAULT_FILE_TREE_WIDTH, tab: "changes" })
-            return
-          }
-          setStore("fileTree", "opened", (x) => !x)
-        },
-        resize(width: number) {
-          if (!store.fileTree) {
-            setStore("fileTree", { opened: true, width, tab: "changes" })
-            return
-          }
-          setStore("fileTree", "width", width)
-        },
-      },
-      session: {
-        width: createMemo(() => store.session?.width ?? DEFAULT_SESSION_WIDTH),
-        resize(width: number) {
-          if (!store.session) {
-            setStore("session", { width })
-            return
-          }
-          setStore("session", "width", width)
-        },
-      },
-      browserPreview: {
-        opened: createMemo(() => store.browserPreview?.opened ?? false),
-        width: createMemo(() => store.browserPreview?.width ?? DEFAULT_BROWSER_PREVIEW_WIDTH),
-        url: createMemo(() => store.browserPreview?.url ?? DEFAULT_BROWSER_PREVIEW_URL),
-        open() {
-          setStore("browserPreview", "opened", true)
-        },
-        close() {
-          setStore("browserPreview", "opened", false)
-          void platform.browserPreview?.hide()
-        },
-        toggle() {
-          if (store.browserPreview?.opened) {
-            setStore("browserPreview", "opened", false)
-            void platform.browserPreview?.hide()
-            return
-          }
-          setStore("browserPreview", "opened", true)
-        },
-        resize(width: number) {
-          setStore("browserPreview", "width", width)
-        },
-        setUrl(url: string) {
-          setStore("browserPreview", "url", url)
         },
       },
       mobileSidebar: {
@@ -769,6 +901,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           setStore("mobileSidebar", "opened", (x) => !x)
         },
       },
+      terminal: flatTerminal(),
+      session: flatSession(),
+      fileTree: flatFileTree(),
+      browserPreview: flatBrowserPreview(),
       pendingMessage: {
         set(sessionKey: string, messageID: string) {
           const at = Date.now()
@@ -815,42 +951,163 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       view(sessionKey: string | Accessor<string>) {
         const key = createSessionKeyReader(sessionKey, ensureKey)
         const s = createMemo(() => store.sessionView[key()] ?? { scroll: {} })
-        const terminalOpened = createMemo(() => store.terminal?.opened ?? false)
-        const reviewPanelOpened = createMemo(() => store.review?.panelOpened ?? DEFAULT_REVIEW_PANEL_OPENED)
+        const panels = createMemo(() => s().panels ?? defaultSessionPanels())
+        const terminalOpened = createMemo(() => panels().terminal.opened)
+        const reviewPanelOpened = createMemo(() => panels().review.panelOpened)
         const reviewPanelSource = createMemo(() => (reviewPanelOpened() ? ephemeral.reviewPanelSource : "other"))
 
-        function setTerminalOpened(next: boolean) {
-          const current = store.terminal
-          if (!current) {
-            setStore("terminal", { height: DEFAULT_TERMINAL_HEIGHT, opened: next })
-            return
+        function getOrInitPanels(): { session: string; current: SessionPanels } {
+          const session = key()
+          const current = store.sessionView[session]?.panels ?? defaultSessionPanels()
+          if (!store.sessionView[session]?.panels) {
+            setStore(
+              "sessionView",
+              session,
+              produce((draft) => {
+                if (!draft) return
+                draft.panels = current
+              }),
+            )
           }
+          return { session, current }
+        }
 
-          const value = current.opened ?? false
-          if (value === next) return
-          setStore("terminal", "opened", next)
+        function setTerminalOpened(next: boolean) {
+          const { current } = getOrInitPanels()
+          if (current.terminal.opened === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "terminal",
+            "opened",
+            next,
+          )
+        }
+
+        function setTerminalHeight(next: number) {
+          const { current } = getOrInitPanels()
+          if (current.terminal.height === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "terminal",
+            "height",
+            next,
+          )
         }
 
         function setReviewPanelOpened(next: boolean, source: ReviewPanelSource) {
+          const { current } = getOrInitPanels()
           const nextSource = next ? source : "other"
-          const current = store.review
-          if (!current) {
-            batch(() => {
-              setStore("review", { diffStyle: "split" as ReviewDiffStyle, panelOpened: next })
-              setEphemeral("reviewPanelSource", nextSource)
-            })
-            return
-          }
-
-          const value = current.panelOpened ?? DEFAULT_REVIEW_PANEL_OPENED
-          if (value === next) {
+          if (current.review.panelOpened === next) {
             if (ephemeral.reviewPanelSource !== nextSource) setEphemeral("reviewPanelSource", nextSource)
             return
           }
           batch(() => {
-            setStore("review", "panelOpened", next)
+            setStore(
+              "sessionView",
+              key(),
+              "panels",
+              "review",
+              "panelOpened",
+              next,
+            )
             setEphemeral("reviewPanelSource", nextSource)
           })
+        }
+
+        function setFileTreeOpened(next: boolean) {
+          const { current } = getOrInitPanels()
+          if (current.fileTree.opened === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "fileTree",
+            "opened",
+            next,
+          )
+        }
+
+        function setFileTreeTab(next: "changes" | "all") {
+          const { current } = getOrInitPanels()
+          if (current.fileTree.tab === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "fileTree",
+            "tab",
+            next,
+          )
+        }
+
+        function setFileTreeWidth(next: number) {
+          const { current } = getOrInitPanels()
+          if (current.fileTree.width === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "fileTree",
+            "width",
+            next,
+          )
+        }
+
+        function setSessionWidth(next: number) {
+          const { current } = getOrInitPanels()
+          if (current.session.width === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "session",
+            "width",
+            next,
+          )
+        }
+
+        function setBrowserPreviewOpened(next: boolean) {
+          const { current } = getOrInitPanels()
+          if (current.browserPreview.opened === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "browserPreview",
+            "opened",
+            next,
+          )
+          if (!next) void platform.browserPreview?.hide()
+        }
+
+        function setBrowserPreviewWidth(next: number) {
+          const { current } = getOrInitPanels()
+          if (current.browserPreview.width === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "browserPreview",
+            "width",
+            next,
+          )
+        }
+
+        function setBrowserPreviewUrl(next: string) {
+          const { current } = getOrInitPanels()
+          if (current.browserPreview.url === next) return
+          setStore(
+            "sessionView",
+            key(),
+            "panels",
+            "browserPreview",
+            "url",
+            next,
+          )
         }
 
         return {
@@ -874,6 +1131,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           },
           terminal: {
             opened: terminalOpened,
+            height: createMemo(() => panels().terminal.height),
             open() {
               setTerminalOpened(true)
             },
@@ -882,6 +1140,55 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
             },
             toggle() {
               setTerminalOpened(!terminalOpened())
+            },
+            resize(height: number) {
+              setTerminalHeight(height)
+            },
+          },
+          fileTree: {
+            opened: createMemo(() => panels().fileTree.opened),
+            width: createMemo(() => panels().fileTree.width),
+            tab: createMemo(() => panels().fileTree.tab),
+            setTab(tab: "changes" | "all") {
+              setFileTreeTab(tab)
+            },
+            open() {
+              setFileTreeOpened(true)
+            },
+            close() {
+              setFileTreeOpened(false)
+            },
+            toggle() {
+              setFileTreeOpened(!panels().fileTree.opened)
+            },
+            resize(width: number) {
+              setFileTreeWidth(width)
+            },
+          },
+          session: {
+            width: createMemo(() => panels().session.width),
+            resize(width: number) {
+              setSessionWidth(width)
+            },
+          },
+          browserPreview: {
+            opened: createMemo(() => panels().browserPreview.opened),
+            width: createMemo(() => panels().browserPreview.width),
+            url: createMemo(() => panels().browserPreview.url),
+            open() {
+              setBrowserPreviewOpened(true)
+            },
+            close() {
+              setBrowserPreviewOpened(false)
+            },
+            toggle() {
+              setBrowserPreviewOpened(!panels().browserPreview.opened)
+            },
+            resize(width: number) {
+              setBrowserPreviewWidth(width)
+            },
+            setUrl(url: string) {
+              setBrowserPreviewUrl(url)
             },
           },
           reviewPanel: {

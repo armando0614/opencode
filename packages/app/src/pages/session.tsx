@@ -429,7 +429,7 @@ export default function Page() {
   const size = createSizing()
   const desktopReviewOpen = createMemo(() => isDesktop() && view().reviewPanel.opened())
   const desktopBrowserPreviewOpen = createMemo(
-    () => isDesktop() && !!platform.browserPreview && layout.browserPreview.opened(),
+    () => isDesktop() && !!platform?.browserPreview && layout.browserPreview.opened(),
   )
   const desktopFileTreeOpen = createMemo(
     () =>

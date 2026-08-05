@@ -465,7 +465,7 @@ export function SessionHeader() {
                     </TooltipKeybind>
 
                     <div class="hidden md:flex items-center gap-1 shrink-0">
-                      <Show when={platform.browserPreview}>
+                      <Show when={platform?.browserPreview}>
                         <TooltipKeybind
                           title={language.t("command.browserPreview.toggle")}
                           keybind={command.keybind("browserPreview.toggle")}
