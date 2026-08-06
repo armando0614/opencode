@@ -66,13 +66,14 @@ import { Persist, persisted } from "@/utils/persist"
 import { useMarked } from "@opencode-ai/ui/context/marked"
 import { preloadMarkdown } from "@opencode-ai/session-ui/markdown-cache"
 import { archiveHomeSession } from "./home-session-archive"
+import { deleteHomeSession } from "./home-session-delete"
+import { Dialog } from "@opencode-ai/ui/dialog"
 import { showToast } from "@/utils/toast"
 
 const HOME_SESSION_LIMIT = 64
 const HOME_SESSION_HEADER_STICKY_TOP = 12
 const HOME_SESSION_HEADER_TEXT_HEIGHT = 16
 const HOME_SESSION_HEADER_FADE_DISTANCE = 16
-const SHOW_HOME_SESSION_ARCHIVE = false
 const HOME_ROW_LAYOUT =
   "flex min-w-0 w-full shrink-0 cursor-default items-center rounded-[6px] bg-transparent text-left transition-[background-color,color,box-shadow] duration-[120ms] ease-in-out focus-visible:outline-none"
 const HOME_ROW_BASE = `${HOME_ROW_LAYOUT} border-0`
@@ -498,6 +499,30 @@ export function NewHome() {
     })
   }
 
+  async function deleteSession(session: Session) {
+    const conn = focusedServer()
+    const ctx = focusedServerCtx()
+    if (!conn || !ctx) return
+    const [, setStore] = ctx.sync.child(session.directory)
+    await deleteHomeSession({
+      server: ServerConnection.key(conn),
+      session,
+      delete: (value) => ctx.sdk.client.session.delete(value),
+      remove: () =>
+        setStore(
+          produce((draft) => {
+            const match = Binary.search(draft.session, session.id, (s) => s.id)
+            if (match.found) draft.session.splice(match.index, 1)
+          }),
+        ),
+      onError: (error) =>
+        showToast({
+          title: language.t("session.delete.failed.title"),
+          description: errorMessage(error, language.t("session.delete.failed.title")),
+        }),
+    })
+  }
+
   function chooseProject(conn: ServerConnection.Any) {
     if (global.servers.health[ServerConnection.key(conn)]?.healthy === false) return
 
@@ -614,7 +639,7 @@ export function NewHome() {
                                 server={selection().server}
                                 activeServer={selection().server === server.key}
                                 openSession={openSession}
-                                archiveSession={archiveSession}
+                                deleteSession={deleteSession}
                               />
                             )}
                           </For>
@@ -1299,11 +1324,17 @@ function HomeSessionRow(props: {
   server: ServerConnection.Key
   activeServer: boolean
   openSession: (session: Session) => void
-  archiveSession: (session: Session) => Promise<void>
+  deleteSession: (session: Session) => Promise<void>
 }) {
   const language = useLanguage()
+  const dialog = useDialog()
   const title = createMemo(() => sessionTitle(props.record.session.title) || props.record.session.id)
   const showProjectName = () => props.showProjectName && props.record.projectName
+
+  const handleDelete = async () => {
+    await props.deleteSession(props.record.session)
+    dialog.close()
+  }
 
   return (
     <div
@@ -1334,24 +1365,40 @@ function HomeSessionRow(props: {
           </span>
         </Show>
       </button>
-      <Show when={SHOW_HOME_SESSION_ARCHIVE}>
-        <div class="hover-reveal absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1 group-hover/session:opacity-100 focus-within:opacity-100">
-          <TooltipV2 class="flex shrink-0 items-center" placement="bottom" value={language.t("common.archive")}>
-            <IconButtonV2
-              data-action="home-session-archive"
-              variant="ghost-muted"
-              size="large"
-              icon={<IconV2 name="archive" />}
-              aria-label={language.t("common.archive")}
-              onClick={(event) => {
-                event.preventDefault()
-                event.stopPropagation()
-                void props.archiveSession(props.record.session)
-              }}
-            />
-          </TooltipV2>
-        </div>
-      </Show>
+      <div class="hover-reveal absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1 group-hover/session:opacity-100 focus-within:opacity-100">
+        <TooltipV2 class="flex shrink-0 items-center" placement="bottom" value={language.t("session.delete.title")}>
+          <IconButtonV2
+            data-action="home-session-delete"
+            variant="ghost-muted"
+            size="large"
+            icon={<IconV2 name="close" />}
+            aria-label={language.t("session.delete.title")}
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              dialog.show(() => (
+                <Dialog title={language.t("session.delete.title")} fit>
+                  <div class="flex flex-col gap-4 pl-6 pr-2.5 pb-3">
+                    <div class="flex flex-col gap-1">
+                      <span class="text-14-regular text-text-strong">
+                        {language.t("session.delete.confirm", { name: title() })}
+                      </span>
+                    </div>
+                    <div class="flex justify-end gap-2">
+                      <Button variant="ghost" size="large" onClick={() => dialog.close()}>
+                        {language.t("common.cancel")}
+                      </Button>
+                      <Button variant="primary" size="large" onClick={handleDelete}>
+                        {language.t("session.delete.button")}
+                      </Button>
+                    </div>
+                  </div>
+                </Dialog>
+              ))
+            }}
+          />
+        </TooltipV2>
+      </div>
     </div>
   )
 }
